@@ -1,4 +1,5 @@
 #!/usr/bin/python3
+import asyncio
 import argparse
 import os
 import subprocess
@@ -9,36 +10,75 @@ import glob
 import shutil
 
 
+async def run_command(command):
+    """
+    Create an async task.
+    """
+    task = await asyncio.create_subprocess_exec(
+            *command,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+    await task.wait()
+    stderr = await task.stderr.read()
+
+    if stderr.decode():
+        raise ValueError(stderr.decode())
+
+
+def run_tasks(task_list):
+    """
+    Runs a list of async tasks.
+    """
+    loop = asyncio.get_event_loop()
+    return loop.run_until_complete(asyncio.gather(*task_list))
+
+
 def create_initrd(parser, args):
     if not args.kerneldir:
         args.kerneldir = "/lib/modules/%s" % args.kernelver
+
     if args.root:
         args.skeleton = os.path.join(args.root, args.skeleton)
         args.kerneldir = os.path.join(args.root, args.kerneldir)
         args.firmwaredir = os.path.join(args.root, args.firmwaredir)
         args.output = os.path.join(args.root, args.output)
+
     if args.kernelver:
         args.output = "-".join([args.output, args.kernelver])
+
     with tempfile.TemporaryDirectory(suffix=".ubuntu-core-initramfs") as d:
+        tasks = []
+
         kernel_root = os.path.join(d, "kernel")
         modules = os.path.join(kernel_root, "usr", "lib", "modules")
+
         os.makedirs(modules, exist_ok=True)
         modules = os.path.join(modules, args.kernelver)
-        subprocess.check_call(["cp", "-ar", args.kerneldir, modules])
+        tasks.append(run_command(["cp", "-ar", args.kerneldir, modules]))
 
         firmware = os.path.join(kernel_root, "usr", "lib", "firmware")
-        subprocess.check_call(["cp", "-ar", args.firmwaredir, firmware])
+        tasks.append(run_command(["cp", "-ar", args.firmwaredir, firmware]))
 
         main = os.path.join(d, "main")
         os.makedirs(main, exist_ok=True)
+
         for feature in args.features:
             # Needs https://github.com/snapcore/snapd/pull/10351 to land
             if feature == "cloudimg-rootfs":
                 os.unlink(os.path.join(main, "usr/lib/systemd/system/sysroot.mount"))
-            subprocess.check_call(["cp", "-ar", "%s/%s/." % (args.skeleton, feature), main])
+
+            tasks.append(
+                run_command(["cp", "-ar", "%s/%s/." % (args.skeleton, feature), main]))
+
+        # Run all tasks so far
+        run_tasks(tasks)
+
         # Update epoch
         pathlib.Path("%s/main/usr/lib/clock-epoch" % d).touch()
+
         # Should itirate all the .conf drop ins
+        dracut_tasks = []
         for module_load in glob.iglob("%s/usr/lib/modules-load.d/*.conf" % main):
             with open(module_load) as f:
                 for module in f.readlines():
@@ -46,7 +86,7 @@ def create_initrd(parser, args):
                     if module:
                         if module[0] in ["#", ";"]:
                             continue
-                        subprocess.check_call(
+                        dracut_tasks.append(run_command(
                             [
                                 "/usr/lib/dracut/dracut-install",
                                 "-D",
@@ -60,10 +100,11 @@ def create_initrd(parser, args):
                                 "--optional",
                                 module,
                             ]
-                        )
+                        ))
+
 
         for modulesf in ["modules.order", "modules.builtin", "modules.builtin.bin"]:
-            subprocess.check_call(
+            dracut_tasks.append(run_command(
                 [
                     "/usr/lib/dracut/dracut-install",
                     "-D",
@@ -72,23 +113,33 @@ def create_initrd(parser, args):
                     os.path.join(modules, modulesf),
                     os.path.join("usr/lib/modules", args.kernelver, modulesf),
                 ]
-            )
+            ))
+
+        # Run dracut tasks
+        run_tasks(dracut_tasks)
+
         subprocess.check_call(["depmod", "-a", "-b", main, args.kernelver])
+
+        cpio_tasks = []
         with open(args.output, "wb") as output:
             for early in glob.iglob("%s/early/*.cpio" % args.skeleton):
                 with open(early, "rb") as f:
                     shutil.copyfileobj(f, output)
-            subprocess.check_call(
+            cpio_tasks.append(run_command(
                 "find . | cpio --create --quiet --format='newc' --owner=0:0 | lz4 -9 -l",
                 cwd=main,
                 shell=True,
                 stdout=output,
-            )
+            ))
+
+        # Run cpio tasks
+        run_tasks(cpio_tasks)
 
 
 def create_efi(parser, args):
     if not args.stub:
         parser.error("--stub is required, and one was not automatically detected")
+
     if args.root:
         args.stub = os.path.join(args.root, args.stub)
         args.sbat = os.path.join(args.root, args.sbat)
@@ -97,6 +148,7 @@ def create_efi(parser, args):
         args.key = os.path.join(args.root, args.key)
         args.cert = os.path.join(args.root, args.cert)
         args.output = os.path.join(args.root, args.output)
+
     if args.kernelver:
         args.kernel = "-".join([args.kernel, args.kernelver])
         args.initrd = "-".join([args.initrd, args.kernelver])
@@ -113,6 +165,7 @@ def create_efi(parser, args):
     objcopy_cmd = [
             "objcopy",
         ]
+
     # TODO add .osrel
     if args.cmdline:
         cmdline = tempfile.NamedTemporaryFile(mode='w')
@@ -124,6 +177,7 @@ def create_efi(parser, args):
             "--change-section-vma",
             ".cmdline=0x30000"
             ]
+
     # TODO add .splash
     objcopy_cmd += [
             "--add-section",
@@ -169,7 +223,7 @@ def main():
     suffix = {"x86_64": "x64", "aarch64": "aa64"}.get(platform.machine())
     features = {"x86_64": "main server"}.get(platform.machine(), "main")
     parser = argparse.ArgumentParser()
-    subparser = parser.add_subparsers(dest="subcmd", required=True)
+    subparser = parser.add_subparsers(dest="subcmd")
     efi_parser = subparser.add_parser(
         "create-efi", formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
@@ -239,6 +293,7 @@ def main():
     args = parser.parse_args()
     if args.subcmd == "create-initrd" and not args.features:
         args.features = features.split()
+
     globals()[args.subcmd.replace("-", "_")](parser, args)
 
 
