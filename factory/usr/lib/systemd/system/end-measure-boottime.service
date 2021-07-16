@@ -1,0 +1,7 @@
+[Unit]
+Requires=start-measure-boottime.service
+After=start-measure-boottime.service
+
+[Service]
+Type=oneshot
+ExecStart=echo Initrd boot time: $[`date +%s%N | cut -b1-13`-`cat /tmp/boot-start`] ms

@@ -1,0 +1,3 @@
+[Service]
+Type=oneshot
+ExecStart=date +%s%N | cut -b1-13 > /tmp/boot-start
